@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Мой проект на хакатоне</title>
+    </head>
+    <body>
+        <h1>Калькулятор</h1>
+        <input type="number" id="input1" placeholder="Введите число 1" />
+        <input type="number" id="input2" placeholder="Введите число 2" />
+        <button onclick="sendData()">Вычислить</button>
+        <div id="result">Результат:</div>
+
+        <script>
+            async function sendData() {
+                const input1 = document.getElementById("input1").value;
+                const input2 = document.getElementById("input2").value;
+
+                try {
+                    const response = await fetch(
+                        "http://localhost:8000/calculate",
+                        {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify({
+                                input1: parseFloat(input1),
+                                input2: parseFloat(input2),
+                            }),
+                        },
+                    );
+
+                    const data = await response.json();
+                    document.getElementById("result").textContent =
+                        `Результат: ${data.result}`;
+                } catch (error) {
+                    console.error("Ошибка:", error);
+                    document.getElementById("result").textContent =
+                        `Ошибка: ${error.message}`;
+                }
+            }
+        </script>
+    </body>
+</html>
