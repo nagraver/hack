@@ -1,0 +1,34 @@
+/* Основные стили */
+.prompt-box, .response-box {
+    padding: 20px;
+    border-radius: 8px;
+    font-size: 16px;
+}
+
+.repo-input textarea {
+    font-family: monospace;
+    min-height: 120px !important;
+}
+
+.status-box {
+    background: #f8f9fa;
+    padding: 15px;
+    border-radius: 6px;
+}
+
+/* Анимации */
+button {
+    transition: all 0.3s ease;
+}
+
+button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+/* Адаптивность */
+@media (max-width: 768px) {
+    .prompt-box, .response-box {
+        font-size: 14px;
+    }
+}

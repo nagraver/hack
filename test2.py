@@ -206,53 +206,85 @@ qa_chain = RetrievalQA.from_chain_type(
 )
 
 # === Функции для Gradio ===
-def answer_question(question):
-    response = qa_chain({"query": question})
-    
-    # Получаем ответ и исходные документы
-    answer = response["result"]
-    source_docs = response["source_documents"]
-    
-    # Формируем список уникальных исходных файлов
-    source_files = set()
-    for doc in source_docs:
-        if "source_file" in doc.metadata:
-            source_files.add(doc.metadata["source_file"])
-    
-    # Формируем итоговый ответ с указанием источников
-    if source_files:
-        answer += "\n\nИсточники:\n- " + "\n- ".join(source_files)
-    
-    return answer
-
-def add_repository(repo_url):
-    try:
-        add_repository_to_store(vector_store, repo_url)
-        return "Репозиторий успешно добавлен!"
-    except Exception as e:
-        return f"Ошибка при добавлении репозитория: {str(e)}"
-
-# === Интерфейс Gradio ===
-with gr.Blocks() as demo:
+with gr.Blocks(css="style.css", theme=gr.themes.Default()) as demo:  # Добавляем CSS
     gr.Markdown("## 🧠 Локальный ассистент по коду")
     gr.Markdown("Использует LLaMA 3.1 через LM Studio + LangChain + Qdrant + bge-m3")
     
-    with gr.Tab("Задать вопрос"):
-        question_input = gr.Textbox(lines=2, placeholder="Задай вопрос по проекту...", label="Вопрос")
-        answer_output = gr.Textbox(label="Ответ")
-        ask_button = gr.Button("Спросить")
-    
-    with gr.Tab("Добавить репозиторий"):
-        repo_url_input = gr.Textbox(
-            placeholder="https://github.com/username/repository.git",
-            label="URL GitHub репозитория"
-        )
-        add_repo_button = gr.Button("Добавить репозиторий")
-        repo_status_output = gr.Textbox(label="Статус")
-    
-    ask_button.click(answer_question, inputs=question_input, outputs=answer_output)
-    add_repo_button.click(add_repository, inputs=repo_url_input, outputs=repo_status_output)
+    with gr.Tab("💬 Задать вопрос", id="qa_tab"):
+        with gr.Row(variant="panel"):
+            with gr.Column(scale=7):
+                question_input = gr.Textbox(
+                    lines=2,
+                    placeholder="Введите ваш вопрос о проекте...",
+                    label=" ",
+                    elem_classes=["prompt-box"]
+                )
+                
+                with gr.Accordion("⚙️ Настройки модели", open=False):
+                    with gr.Group():
+                        temperature = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="Температура")
+                        max_tokens = gr.Slider(128, 4096, value=1024, step=128, label="Макс. токенов")
+                        top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.1, label="Top-p выборка")
+                
+                with gr.Accordion("🔍 Настройки поиска", open=False):
+                    with gr.Row():
+                        k_results = gr.Slider(1, 10, value=5, step=1, label="Результатов")
+                        fetch_k = gr.Slider(5, 50, value=20, step=5, label="Кандидатов")
+                    mmr_lambda = gr.Slider(0.0, 1.0, value=0.5, step=0.1, label="Разнообразие (MMR)")
+                
+                gr.Examples(
+                    examples=[
+                        "Покажи архитектуру проекта",
+                        "Какие зависимости используются?",
+                        "Объясни механизм обработки данных"
+                    ],
+                    inputs=question_input,
+                    label="Примеры вопросов"
+                )
 
+            with gr.Column(scale=3):
+                answer_output = gr.Textbox(
+                    label="📝 Ответ",
+                    elem_classes=["response-box"],
+                    interactive=False
+                )
+                ask_button = gr.Button("🚀 Отправить", variant="primary")
+
+        ask_button.click(
+            answer_question,
+            inputs=[question_input, temperature, max_tokens, top_p, k_results, fetch_k, mmr_lambda],
+            outputs=answer_output
+        )
+    
+    with gr.Tab("➕ Добавить репозиторий", id="repo_tab"):
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### Добавление нового репозитория")
+                with gr.Group():
+                    repo_url_input = gr.Textbox(
+                        placeholder="https://github.com/username/repository.git",
+                        label="GitHub URL",
+                        elem_classes=["repo-input"]
+                    )
+                    with gr.Accordion("🔧 Параметры обработки", open=False):
+                        chunk_size = gr.Slider(128, 1024, value=512, step=64, label="Размер фрагмента")
+                        chunk_overlap = gr.Slider(0, 256, value=50, step=16, label="Перекрытие фрагментов")
+                add_repo_button = gr.Button("📥 Импортировать репозиторий", variant="primary")
+                
+            with gr.Column():
+                repo_status_output = gr.Textbox(
+                    label="Статус операции",
+                    elem_classes=["status-box"],
+                    interactive=False
+                )
+                gr.Markdown("### Рекомендации")
+                gr.Markdown("- Используйте HTTPS URL репозитория\n- Большие репозитории обрабатываются дольше\n- Оптимальный размер чанка 512-768 токенов")
+
+        add_repo_button.click(
+            add_repository,
+            inputs=[repo_url_input, chunk_size, chunk_overlap],
+            outputs=repo_status_output
+        )
 # === Запуск веб-интерфейса ===
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)

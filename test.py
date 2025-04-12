@@ -1,201 +1,339 @@
+from pathlib import Path  # Добавляем для работы с путями к файлам
 import os
-import logging
-import tempfile
-from typing import List
-
+import requests
 import gradio as gr
-from git import Repo
-from langchain_openai import ChatOpenAI
-from langchain_core.documents import Document
+import logging
+from typing import Optional, List
+from uuid import uuid4
+import subprocess
+import tempfile
+
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import SentenceTransformersTokenTextSplitter
+from langchain_core.language_models.llms import LLM
+from langchain_core.documents import Document
 from langchain_qdrant import QdrantVectorStore
-from langchain_text_splitters import (
-    Language,
-    RecursiveCharacterTextSplitter,
-)
-from langchain_community.document_loaders.generic import GenericLoader
-from langchain_community.document_loaders.parsers import LanguageParser
 from qdrant_client import QdrantClient
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+from qdrant_client.http.models import Distance, VectorParams
 
-# Configure logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "code-assistant-store")
 
-# Configuration
-EMBEDDING_MODEL = "BAAI/bge-m3"
-COLLECTION_NAME = "github-repo-qa"
-LOCAL_LLM_ENDPOINT = "http://localhost:1234/v1"  # LM Studio default endpoint
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
 
-class GitHubRepoQA:
-    def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            encode_kwargs={'truncation': True, 'max_length': 512}
+class LMStudioLLM(LLM):
+    model: str = "local-model"
+    base_url: str = "http://127.0.0.1:1234/v1"
+    temperature: float = 0.7
+    max_tokens: int = 1024
+    top_p: float = 0.9
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+        }
+        response = requests.post(f"{self.base_url}/chat/completions", json=payload)
+        return response.json()["choices"][0]["message"]["content"]
+
+    @property
+    def _llm_type(self) -> str:
+        return "lmstudio-llm"
+
+
+def configure_qdrant() -> QdrantVectorStore:
+    """Configure and return a Qdrant vector store."""
+    logger.info("Configuring Qdrant client and vector store...")
+
+    # Инициализация модели эмбедингов
+    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3", encode_kwargs={"truncation": True, "max_length": 512})
+    embeddings.embed_query("test")  # Прогрев модели
+
+    # Создание клиента Qdrant
+    client = QdrantClient(path="/tmp/langchain_qdrant")
+
+    # Создание коллекции, если она не существует
+    try:
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
         )
-        self.client = QdrantClient(path=":memory:")
-        self.vector_store = None
-        self.retriever = None
-        self.qa_chain = None
-        
-    def clone_repo(self, repo_url: str, temp_dir: str) -> str:
-        """Clone a GitHub repository to a temporary directory."""
+    except ValueError:
+        logger.info("Collection already exists. Skipping creation.")
+
+    # Создание векторного хранилища
+    vector_store = QdrantVectorStore(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding=embeddings,
+    )
+
+    logger.info("Qdrant configuration completed.")
+    return vector_store
+
+
+def clone_github_repo(repo_url: str, temp_dir: str) -> str:
+    """Clone GitHub repository to temporary directory."""
+    try:
+        repo_name = repo_url.split("/")[-1]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+        repo_path = os.path.join(temp_dir, repo_name)
+
+        subprocess.run(["git", "clone", repo_url, repo_path], check=True)
+        logger.info(f"Repository cloned successfully to {repo_path}")
+        return repo_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to clone repository: {e}")
+        raise
+
+
+def load_documents_from_repo(repo_path: str) -> List[Document]:
+    """Load documents from repository."""
+    documents = []
+
+    for root, _, files in os.walk(repo_path):
+        for file in files:
+            if file.endswith((".txt", ".md", ".py", ".js", ".java", ".cpp", ".h", ".html", ".css")):
+                file_path = os.path.join(root, file)
+                try:
+                    loader = TextLoader(file_path, encoding="utf-8")
+                    loaded_docs = loader.load()
+                    for doc in loaded_docs:
+                        doc.metadata["source_file"] = file_path  # Добавляем путь к файлу в метаданные
+                    documents.extend(loaded_docs)
+                    logger.info(f"Loaded {file_path}")
+                except Exception as e:
+                    logger.warning(f"Could not load {file_path}: {e}")
+
+    return documents
+
+
+def add_repository_to_store(
+    vector_store: QdrantVectorStore, repo_url: str, chunk_size: int = 512, chunk_overlap: int = 50
+) -> None:
+    """Add repository documents to vector store."""
+    with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            repo_dir = os.path.join(temp_dir, "repo")
-            Repo.clone_from(repo_url, repo_dir)
-            logger.info(f"Repository cloned successfully to {repo_dir}")
-            return repo_dir
+            # Клонируем репозиторий
+            repo_path = clone_github_repo(repo_url, temp_dir)
+
+            # Загружаем документы
+            documents = load_documents_from_repo(repo_path)
+
+            if not documents:
+                raise ValueError("No documents found in repository")
+
+            # Разделяем документы на чанки
+            splitter = SentenceTransformersTokenTextSplitter(
+                tokens_per_chunk=chunk_size, chunk_overlap=chunk_overlap, model_name="BAAI/bge-m3"
+            )
+            texts = splitter.split_documents(documents)
+
+            # Добавляем в векторное хранилище
+            ids = [str(uuid4()) for _ in texts]
+            vector_store.add_documents(documents=texts, ids=ids)
+            logger.info(f"Added {len(texts)} documents from repository to vector store")
+
         except Exception as e:
-            logger.error(f"Error cloning repository: {e}")
+            logger.error(f"Error processing repository: {e}")
             raise
 
-    def load_documents(self, repo_path: str) -> List[Document]:
-        """Load documents from the repository with language-specific parsing."""
-        loader = GenericLoader.from_filesystem(
-            repo_path,
-            glob="**/*",
-            suffixes=[".py", ".js", ".java", ".go", ".rs", ".c", ".cpp", ".h", ".hpp"],
-            parser=LanguageParser(language=Language.PYTHON, parser_threshold=500),
+
+def load_or_create_vector_store(
+    vector_store: QdrantVectorStore, file_path: str = None, chunk_size: int = 512, chunk_overlap: int = 50
+) -> QdrantVectorStore:
+    """Load or create vector store with documents."""
+    # Проверяем, есть ли уже документы в хранилище
+    client = vector_store.client
+    collection_info = client.get_collection(COLLECTION_NAME)
+
+    if collection_info.vectors_count == 0 and file_path:
+        logger.info("No documents in vector store. Creating new index...")
+
+        # Загрузка документов
+        loader = TextLoader(file_path)
+        documents = loader.load()
+        for doc in documents:
+            doc.metadata["source_file"] = file_path  # Добавляем путь к файлу в метаданные
+
+        # Разделение документов на чанки
+        splitter = SentenceTransformersTokenTextSplitter(
+            tokens_per_chunk=chunk_size, chunk_overlap=chunk_overlap, model_name="BAAI/bge-m3"
         )
-        return loader.load()
+        texts = splitter.split_documents(documents)
 
-    def split_documents(self, docs: List[Document]) -> List[Document]:
-        """Split documents into chunks with language-aware splitting."""
-        splitter = RecursiveCharacterTextSplitter.from_language(
-            language=Language.PYTHON,
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
-        return splitter.split_documents(docs)
+        # Добавление документов в хранилище
+        ids = [str(uuid4()) for _ in texts]
+        vector_store.add_documents(documents=texts, ids=ids)
+        logger.info(f"Added {len(texts)} documents to vector store.")
+    else:
+        logger.info(f"Vector store already contains {collection_info.vectors_count} vectors. Using existing index.")
 
-    def setup_vector_store(self, docs: List[Document]) -> None:
-        """Set up Qdrant vector store with documents."""
-        # Create collection if it doesn't exist
-        try:
-            self.client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config={"size": 1024, "distance": "Cosine"},
-            )
-        except Exception:
-            logger.info("Collection already exists")
+    return vector_store
 
-        self.vector_store = QdrantVectorStore(
-            client=self.client,
-            collection_name=COLLECTION_NAME,
-            embedding=self.embeddings,
-        )
-        
-        # Add documents to the vector store
-        self.vector_store.add_documents(docs)
-        
-        # Configure retriever
-        self.retriever = self.vector_store.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": 5}
-        )
 
-    def setup_qa_chain(self) -> None:
-        """Set up the QA chain with the local LLM."""
-        template = """Answer the question based only on the following context, 
-        which includes source file information. Always cite the source files 
-        you used to derive your answer:
+# === Инициализация компонентов ===
+llm = LMStudioLLM()
+vector_store = configure_qdrant()
 
-        {context}
+# Загрузка или создание векторного хранилища
+FILE_PATH = r"./my_notes.txt"
+if os.path.exists(FILE_PATH):
+    vector_store = load_or_create_vector_store(vector_store, FILE_PATH)
+else:
+    vector_store = load_or_create_vector_store(vector_store)
 
-        Question: {question}
-        """
-        prompt = ChatPromptTemplate.from_template(template)
-        
-        self.qa_chain = (
-            {"context": self.retriever, "question": RunnablePassthrough()}
-            | prompt
-            | self._get_local_llm()
-            | StrOutputParser()
-        )
 
-    def _get_local_llm(self):
-        """Get the local LLM from LM Studio."""
-        
-        return ChatOpenAI(
-            base_url=LOCAL_LLM_ENDPOINT,
-            api_key="not-needed",  # LM Studio doesn't require an API key
-            model="local-model",
-            temperature=0.1,
-        )
+# === Функции для Gradio ===
+def answer_question(question, temperature, max_tokens, top_p, k_results, fetch_k, mmr_lambda):
+    # Обновляем параметры LLM
+    llm.temperature = temperature
+    llm.max_tokens = max_tokens
+    llm.top_p = top_p
 
-    def process_repository(self, repo_url: str) -> str:
-        """Process a GitHub repository and set up the QA system."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            try:
-                # Clone repository
-                repo_path = self.clone_repo(repo_url, temp_dir)
-                
-                # Load and split documents
-                docs = self.load_documents(repo_path)
-                split_docs = self.split_documents(docs)
-                
-                # Setup vector store and QA chain
-                self.setup_vector_store(split_docs)
-                self.setup_qa_chain()
-                
-                return "Repository processed successfully! You can now ask questions."
-            except Exception as e:
-                logger.error(f"Error processing repository: {e}")
-                return f"Error: {str(e)}"
-
-    def ask_question(self, question: str) -> str:
-        """Ask a question about the repository."""
-        if not self.qa_chain:
-            return "Please process a repository first."
-        
-        try:
-            return self.qa_chain.invoke(question)
-        except Exception as e:
-            logger.error(f"Error answering question: {e}")
-            return f"Error answering question: {str(e)}"
-
-# Create the QA system instance
-qa_system = GitHubRepoQA()
-
-# Gradio interface
-with gr.Blocks() as demo:
-    gr.Markdown("# GitHub Repository QA System")
-    gr.Markdown("Ask questions about a public GitHub repository")
-    
-    with gr.Row():
-        with gr.Column():
-            repo_url = gr.Textbox(
-                label="GitHub Repository URL",
-                placeholder="https://github.com/username/repo",
-            )
-            process_btn = gr.Button("Process Repository")
-            status = gr.Textbox(label="Status")
-        
-        with gr.Column():
-            question = gr.Textbox(
-                label="Question",
-                placeholder="What does this repository do?",
-            )
-            ask_btn = gr.Button("Ask Question")
-            answer = gr.Textbox(label="Answer", lines=10)
-    
-    process_btn.click(
-        qa_system.process_repository,
-        inputs=repo_url,
-        outputs=status,
+    # Настраиваем ретривер с новыми параметрами
+    retriever = vector_store.as_retriever(
+        search_type="mmr", search_kwargs={"k": k_results, "fetch_k": fetch_k, "lambda_mult": mmr_lambda}
     )
-    
-    ask_btn.click(
-        qa_system.ask_question,
-        inputs=question,
-        outputs=answer,
+
+    # Сборка цепочки с текущими параметрами
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        chain_type="stuff",
+        chain_type_kwargs={"prompt": prompt_template},
+        return_source_documents=True,
+    )
+
+    response = qa_chain({"query": question})
+
+    # Получаем ответ и исходные документы
+    answer = response["result"]
+    source_docs = response["source_documents"]
+
+    # Формируем список уникальных исходных файлов
+    source_files = set()
+    for doc in source_docs:
+        if "source_file" in doc.metadata:
+            source_files.add(doc.metadata["source_file"])
+
+    # Формируем итоговый ответ с указанием источников
+    if source_files:
+        answer += "\n\nИсточники:\n- " + "\n- ".join(source_files)
+
+    return answer
+
+
+def add_repository(repo_url, chunk_size, chunk_overlap):
+    try:
+        add_repository_to_store(vector_store, repo_url, chunk_size, chunk_overlap)
+        return "Репозиторий успешно добавлен!"
+    except Exception as e:
+        return f"Ошибка при добавлении репозитория: {str(e)}"
+
+
+# === Кастомный промпт ===
+prompt_template = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "Твоя задача - анализировать загруженный проект и отвечать на вопросы пользователя касательно проекта\n\n"
+        "Контекст:\n{context}\n\nВопрос: {question}\nОтвет:"
+    ),
+)
+
+# === Интерфейс Gradio ===
+# ... (все предыдущие импорты остаются такими же)
+
+# ... (весь предыдущий код до блока с Gradio интерфейсом остается без изменений)
+
+# === Интерфейс Gradio ===
+# Проверяем наличие файла со стилями
+css_file = Path("./gradio_style.css")
+custom_css = css_file.read_text() if css_file.exists() else ""
+
+with gr.Blocks(css=custom_css) as demo:
+    gr.Markdown("## 🧠 Локальный ассистент по коду")
+    gr.Markdown("Использует LLaMA 3.1 через LM Studio + LangChain + Qdrant + bge-m3")
+
+    with gr.Tabs():
+        with gr.Tab("Задать вопрос", id="question_tab"):
+            with gr.Row():
+                with gr.Column():
+                    question_input = gr.Textbox(lines=2, placeholder="Задай вопрос по проекту...", label="Вопрос")
+                    with gr.Accordion("Настройки модели", open=False):
+                        temperature = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="Temperature")
+                        max_tokens = gr.Slider(128, 4096, value=1024, step=128, label="Max Tokens")
+                        top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.1, label="Top-p")
+                    with gr.Accordion("Настройки поиска", open=False):
+                        k_results = gr.Slider(1, 10, value=5, step=1, label="Количество результатов")
+                        fetch_k = gr.Slider(5, 50, value=20, step=5, label="Fetch K (кол-во кандидатов)")
+                        mmr_lambda = gr.Slider(0.0, 1.0, value=0.5, step=0.1, label="MMR Lambda (разнообразие)")
+                    with gr.Row():
+                        ask_button = gr.Button("Спросить", variant="primary")
+                        clear_btn = gr.Button("Очистить", variant="secondary")
+                with gr.Column():
+                    answer_output = gr.Textbox(label="Ответ", interactive=False)
+
+        with gr.Tab("Добавить репозиторий", id="repo_tab"):
+            with gr.Row():
+                with gr.Column():
+                    repo_url_input = gr.Textbox(
+                        placeholder="https://github.com/username/repository.git", label="URL GitHub репозитория"
+                    )
+                    with gr.Accordion("Настройки чанкинга", open=False):
+                        chunk_size = gr.Slider(128, 1024, value=512, step=64, label="Размер чанка (токены)")
+                        chunk_overlap = gr.Slider(0, 256, value=50, step=16, label="Перекрытие чанков (токены)")
+                    with gr.Row():
+                        add_repo_button = gr.Button("Добавить репозиторий", variant="primary")
+                        clear_repo_btn = gr.Button("Очистить", variant="secondary")
+                with gr.Column():
+                    repo_status_output = gr.Textbox(label="Статус", interactive=False)
+
+        with gr.Tab("Информация", id="info_tab"):
+            gr.Markdown("### Инструкция по использованию")
+            gr.Markdown(
+                """
+            1. **Задать вопрос** - задавайте вопросы о вашем проекте
+            2. **Добавить репозиторий** - загрузите новый репозиторий для анализа
+            3. Настройте параметры модели и поиска для лучших результатов
+            """
+            )
+            gr.Markdown("### Технологии")
+            gr.Markdown(
+                """
+            - **LM Studio** - локальный LLM
+            - **LangChain** - обработка и анализ текста
+            - **Qdrant** - векторное хранилище
+            - **bge-m3** - модели эмбедингов
+            """
+            )
+
+    # Обработчики кнопок очистки
+    clear_btn.click(
+        lambda: [None, 0.7, 1024, 0.9, 5, 20, 0.5],
+        outputs=[question_input, temperature, max_tokens, top_p, k_results, fetch_k, mmr_lambda],
+    )
+    clear_repo_btn.click(lambda: [None, 512, 50], outputs=[repo_url_input, chunk_size, chunk_overlap])
+
+    ask_button.click(
+        answer_question,
+        inputs=[question_input, temperature, max_tokens, top_p, k_results, fetch_k, mmr_lambda],
+        outputs=answer_output,
+    )
+    add_repo_button.click(
+        add_repository, inputs=[repo_url_input, chunk_size, chunk_overlap], outputs=repo_status_output
     )
 
 if __name__ == "__main__":
