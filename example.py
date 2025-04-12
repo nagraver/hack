@@ -1,10 +1,8 @@
 import logging
 import os
-from functools import wraps
 from typing import Any
 from uuid import uuid4
 
-from anyio import Path
 from langchain_core.documents import Document
 from langchain_docling.loader import DoclingLoader
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -12,8 +10,6 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import SentenceTransformersTokenTextSplitter
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from telegram import Update
-from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "tg-store")
