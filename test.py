@@ -254,19 +254,9 @@ prompt_template = PromptTemplate(
 )
 
 # === Интерфейс Gradio ===
-# ... (все предыдущие импорты остаются такими же)
-
-# ... (весь предыдущий код до блока с Gradio интерфейсом остается без изменений)
-
-# === Интерфейс Gradio ===
-# Проверяем наличие файла со стилями
 css_file = Path("./gradio_style.css")
-custom_css = css_file.read_text() if css_file.exists() else ""
 
-with gr.Blocks(css=custom_css) as demo:
-    gr.Markdown("## 🧠 Локальный ассистент по коду")
-    gr.Markdown("Использует LLaMA 3.1 через LM Studio + LangChain + Qdrant + bge-m3")
-
+with gr.Blocks(css=css_file.read_text()) as demo:
     with gr.Tabs():
         with gr.Tab("Задать вопрос", id="question_tab"):
             with gr.Row():
@@ -338,3 +328,4 @@ with gr.Blocks(css=custom_css) as demo:
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
+    

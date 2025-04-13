@@ -18,5 +18,6 @@ dependencies = [
     "langfuse>=2.60.2",
     "openai>=1.73.0",
     "pathlib>=1.0.1",
+    "python-dotenv>=1.1.0",
     "qdrant-client>=1.13.3",
 ]
