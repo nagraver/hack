@@ -1,4 +1,4 @@
-from pathlib import Path  # Добавляем для работы с путями к файлам
+from pathlib import Path
 import os
 import requests
 import gradio as gr
@@ -52,6 +52,21 @@ class LMStudioLLM(LLM):
         return "lmstudio-llm"
 
 
+def clear_vector_store(vector_store: QdrantVectorStore) -> None:
+    """Clear all documents from the vector store."""
+    try:
+        client = vector_store.client
+        client.delete_collection(COLLECTION_NAME)
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+        )
+        logger.info("Vector store collection cleared successfully.")
+    except Exception as e:
+        logger.error(f"Error clearing vector store: {e}")
+        raise
+
+
 def configure_qdrant() -> QdrantVectorStore:
     """Configure and return a Qdrant vector store."""
     logger.info("Configuring Qdrant client and vector store...")
@@ -63,14 +78,14 @@ def configure_qdrant() -> QdrantVectorStore:
     # Создание клиента Qdrant
     client = QdrantClient(path="/tmp/langchain_qdrant")
 
-    # Создание коллекции, если она не существует
+    # Создание коллекции
     try:
         client.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
         )
-    except ValueError:
-        logger.info("Collection already exists. Skipping creation.")
+    except Exception:
+        logger.info("Collection already exists. It will be used.")
 
     # Создание векторного хранилища
     vector_store = QdrantVectorStore(
@@ -111,7 +126,7 @@ def load_documents_from_repo(repo_path: str) -> List[Document]:
                     loader = TextLoader(file_path, encoding="utf-8")
                     loaded_docs = loader.load()
                     for doc in loaded_docs:
-                        doc.metadata["source_file"] = file_path  # Добавляем путь к файлу в метаданные
+                        doc.metadata["source_file"] = file_path
                     documents.extend(loaded_docs)
                     logger.info(f"Loaded {file_path}")
                 except Exception as e:
@@ -121,11 +136,19 @@ def load_documents_from_repo(repo_path: str) -> List[Document]:
 
 
 def add_repository_to_store(
-    vector_store: QdrantVectorStore, repo_url: str, chunk_size: int = 512, chunk_overlap: int = 50
+    vector_store: QdrantVectorStore, 
+    repo_url: str, 
+    chunk_size: int = 512, 
+    chunk_overlap: int = 50,
+    clear_existing: bool = True
 ) -> None:
     """Add repository documents to vector store."""
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
+            # Очищаем хранилище, если требуется
+            if clear_existing:
+                clear_vector_store(vector_store)
+
             # Клонируем репозиторий
             repo_path = clone_github_repo(repo_url, temp_dir)
 
@@ -152,21 +175,25 @@ def add_repository_to_store(
 
 
 def load_or_create_vector_store(
-    vector_store: QdrantVectorStore, file_path: str = None, chunk_size: int = 512, chunk_overlap: int = 50
+    vector_store: QdrantVectorStore, 
+    file_path: str = None, 
+    chunk_size: int = 512, 
+    chunk_overlap: int = 50,
+    clear_existing: bool = True
 ) -> QdrantVectorStore:
     """Load or create vector store with documents."""
-    # Проверяем, есть ли уже документы в хранилище
-    client = vector_store.client
-    collection_info = client.get_collection(COLLECTION_NAME)
-
-    if collection_info.vectors_count == 0 and file_path:
-        logger.info("No documents in vector store. Creating new index...")
+    if file_path:
+        logger.info("Loading documents into vector store...")
+        
+        # Очищаем хранилище, если требуется
+        if clear_existing:
+            clear_vector_store(vector_store)
 
         # Загрузка документов
         loader = TextLoader(file_path)
         documents = loader.load()
         for doc in documents:
-            doc.metadata["source_file"] = file_path  # Добавляем путь к файлу в метаданные
+            doc.metadata["source_file"] = file_path
 
         # Разделение документов на чанки
         splitter = SentenceTransformersTokenTextSplitter(
@@ -179,7 +206,9 @@ def load_or_create_vector_store(
         vector_store.add_documents(documents=texts, ids=ids)
         logger.info(f"Added {len(texts)} documents to vector store.")
     else:
-        logger.info(f"Vector store already contains {collection_info.vectors_count} vectors. Using existing index.")
+        client = vector_store.client
+        collection_info = client.get_collection(COLLECTION_NAME)
+        logger.info(f"Using existing vector store with {collection_info.vectors_count} vectors.")
 
     return vector_store
 
@@ -236,10 +265,10 @@ def answer_question(question, temperature, max_tokens, top_p, k_results, fetch_k
     return answer
 
 
-def add_repository(repo_url, chunk_size, chunk_overlap):
+def add_repository(repo_url, chunk_size, chunk_overlap, clear_existing):
     try:
-        add_repository_to_store(vector_store, repo_url, chunk_size, chunk_overlap)
-        return "Репозиторий успешно добавлен!"
+        add_repository_to_store(vector_store, repo_url, chunk_size, chunk_overlap, clear_existing)
+        return "Репозиторий успешно добавлен!" + (" (старые данные удалены)" if clear_existing else "")
     except Exception as e:
         return f"Ошибка при добавлении репозитория: {str(e)}"
 
@@ -256,8 +285,22 @@ prompt_template = PromptTemplate(
 # === Интерфейс Gradio ===
 css_file = Path("./gradio_style.css")
 
-with gr.Blocks(css=css_file.read_text()) as demo:
+with gr.Blocks(css=css_file.read_text() if css_file.exists() else "") as demo:
     with gr.Tabs():
+        with gr.Tab("Добавить репозиторий", id="repo_tab"):
+            with gr.Row():
+                with gr.Column():
+                    repo_url_input = gr.Textbox(
+                        placeholder="https://github.com/username/repository.git", label="URL GitHub репозитория"
+                    )
+                    with gr.Accordion("Настройки чанкинга", open=False):
+                        chunk_size = gr.Slider(128, 1024, value=512, step=64, label="Размер чанка (токены)")
+                        chunk_overlap = gr.Slider(0, 256, value=50, step=16, label="Перекрытие чанков (токены)")
+                    clear_existing = gr.Checkbox(value=True, label="Очистить существующие данные")
+                    add_repo_button = gr.Button("Добавить репозиторий", variant="primary")
+                with gr.Column():
+                    repo_status_output = gr.Textbox(label="Статус", interactive=False)
+
         with gr.Tab("Задать вопрос", id="question_tab"):
             with gr.Row():
                 with gr.Column():
@@ -270,33 +313,16 @@ with gr.Blocks(css=css_file.read_text()) as demo:
                         k_results = gr.Slider(1, 10, value=5, step=1, label="Количество результатов")
                         fetch_k = gr.Slider(5, 50, value=20, step=5, label="Fetch K (кол-во кандидатов)")
                         mmr_lambda = gr.Slider(0.0, 1.0, value=0.5, step=0.1, label="MMR Lambda (разнообразие)")
-                    with gr.Row():
-                        ask_button = gr.Button("Спросить", variant="primary")
-                        clear_btn = gr.Button("Очистить", variant="secondary")
+                    ask_button = gr.Button("Спросить", variant="primary")
                 with gr.Column():
                     answer_output = gr.Textbox(label="Ответ", interactive=False)
-
-        with gr.Tab("Добавить репозиторий", id="repo_tab"):
-            with gr.Row():
-                with gr.Column():
-                    repo_url_input = gr.Textbox(
-                        placeholder="https://github.com/username/repository.git", label="URL GitHub репозитория"
-                    )
-                    with gr.Accordion("Настройки чанкинга", open=False):
-                        chunk_size = gr.Slider(128, 1024, value=512, step=64, label="Размер чанка (токены)")
-                        chunk_overlap = gr.Slider(0, 256, value=50, step=16, label="Перекрытие чанков (токены)")
-                    with gr.Row():
-                        add_repo_button = gr.Button("Добавить репозиторий", variant="primary")
-                        clear_repo_btn = gr.Button("Очистить", variant="secondary")
-                with gr.Column():
-                    repo_status_output = gr.Textbox(label="Статус", interactive=False)
 
         with gr.Tab("Информация", id="info_tab"):
             gr.Markdown("### Инструкция по использованию")
             gr.Markdown(
                 """
-            1. **Задать вопрос** - задавайте вопросы о вашем проекте
-            2. **Добавить репозиторий** - загрузите новый репозиторий для анализа
+            1. **Добавить репозиторий** - загрузите новый репозиторий для анализа
+            2. **Задать вопрос** - задавайте вопросы о вашем проекте
             3. Настройте параметры модели и поиска для лучших результатов
             """
             )
@@ -310,22 +336,22 @@ with gr.Blocks(css=css_file.read_text()) as demo:
             """
             )
 
-    # Обработчики кнопок очистки
-    clear_btn.click(
-        lambda: [None, 0.7, 1024, 0.9, 5, 20, 0.5],
-        outputs=[question_input, temperature, max_tokens, top_p, k_results, fetch_k, mmr_lambda],
-    )
-    clear_repo_btn.click(lambda: [None, 512, 50], outputs=[repo_url_input, chunk_size, chunk_overlap])
-
     ask_button.click(
         answer_question,
         inputs=[question_input, temperature, max_tokens, top_p, k_results, fetch_k, mmr_lambda],
         outputs=answer_output,
     )
     add_repo_button.click(
-        add_repository, inputs=[repo_url_input, chunk_size, chunk_overlap], outputs=repo_status_output
+        add_repository, 
+        inputs=[repo_url_input, chunk_size, chunk_overlap, clear_existing], 
+        outputs=repo_status_output
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
-    
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=True,
+        show_error=True,
+        debug=True
+    )
